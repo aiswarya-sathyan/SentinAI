@@ -1,0 +1,10 @@
+streamlit>=1.40
+numpy<2
+pandas
+librosa>=0.10
+matplotlib>=3.7
+mediapipe==0.10.14
+opencv-python
+scikit-learn
+# optional: local speech-to-text for the transcript NLP panel (first run downloads a model once)
+# faster-whisper
