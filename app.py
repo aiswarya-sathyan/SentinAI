@@ -2,6 +2,7 @@ import copy
 import hashlib
 import html
 import os
+import re
 import tempfile
 import time
 from pathlib import Path
@@ -159,7 +160,7 @@ for _k, _v in (("timeline", []), ("audit", []), ("_logged", set()), ("fused_sig"
     SS.setdefault(_k, _v)
 
 PANELS = ("voice", "video", "text")
-PANEL_STATE = {"voice": ("res_audio", "res_audio_clean", "sample_voice"),
+PANEL_STATE = {"voice": ("res_audio_v3", "res_audio", "res_audio_clean", "sample_voice"),
                "video": ("res_video", "res_video_clean", "sample_video"),
                "text": ("res_nlp",)}
 
@@ -302,6 +303,14 @@ def _cached(key, token: bytes, fn):
     return res
 
 
+def _md_safe(text: str) -> str:
+    """Escape markdown/LaTeX control chars so ASR output (e.g. "$500", "*", "_") renders literally."""
+    return re.sub(r"([\\`*_$\[\]~#>])", r"\\\1", text)
+
+
+_SEVERITY = {"INCONCLUSIVE": 0, "AUTHENTIC": 1, "SUSPICIOUS": 2, "SYNTHETIC": 3}
+
+
 def _tmp_run(data: bytes, suffix: str, fn):
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
         f.write(data)
@@ -399,25 +408,104 @@ def voice_panel(ns, snr_db):
             SS["last_audio"] = None
             empty_state("Awaiting voice signal. Record a sample or upload a file.")
             return
+
         sha = audit.sha256_bytes(data)
         SS["last_audio"] = (data, suffix)
-        res = _cached("res_audio", data + suffix.encode() + str(snr_db).encode(),
-                      lambda: _tmp_run(data, suffix, lambda p: detector.analyze_audio_stream(p, noise_snr_db=snr_db)))
+
+        # ------------------------------------------------------------------ #
+        # DUAL-ENGINE PIPELINE: ACOUSTIC DSP + LOCAL STT & NLP               #
+        # ------------------------------------------------------------------ #
+        def _full_pipeline(path):
+            # 1. Physical / acoustic checks: how does it SOUND? (never raises)
+            res_d = detector.analyze_audio_stream(path, noise_snr_db=snr_db)
+            acoustic = float(res_d.get("risk") or 0.0)
+
+            # 2. Local speech-to-text: what was SAID? (always attempted, even if step 1 rejected the clip)
+            transcript, asr_err = nlp_analyzer.transcribe(path)
+            res_d["transcript"], res_d["asr_error"] = transcript, asr_err
+            res_d["acoustic_risk"], res_d["semantic_risk"], res_d["nlp"] = acoustic, 0.0, None
+            if not transcript:
+                return res_d
+
+            # 3. Semantic intent on the transcript
+            nlp_res = nlp_analyzer.analyze_text(transcript)
+            res_d["nlp"] = nlp_res
+            if not nlp_res.get("ok"):
+                return res_d
+            semantic = float(nlp_res.get("risk") or 0.0)
+            res_d["semantic_risk"] = semantic
+            intent = nlp_res.get("verdict") in ("SCAM-LIKE", "SUSPICIOUS")   # e.g. "ATM PIN", "OTP"
+
+            # 4. Fusion: 70 % acoustic + 30 % semantic; scam intent can never score below 0.45.
+            #    If the acoustic engine rejected the clip, only the semantic evidence is available.
+            fused = (0.70 * acoustic + 0.30 * semantic) if res_d.get("ok") else semantic
+            if intent:
+                fused = max(fused, 0.45)
+            fused = float(min(fused, 1.0))
+
+            conf = float(res_d.get("confidence") or 0.0)
+            if intent:
+                conf = max(conf, float(nlp_res.get("confidence") or 0.0))
+            verdict = detector._verdict(fused, conf)
+            if intent and verdict in ("AUTHENTIC", "INCONCLUSIVE"):
+                verdict = "SUSPICIOUS"
+            # fusion may raise the verdict but must never hide what the acoustic engine found
+            if _SEVERITY.get(res_d.get("verdict"), 0) > _SEVERITY.get(verdict, 0):
+                verdict = res_d["verdict"]
+
+            if not res_d.get("ok") and intent:            # intent alone is enough to show a result
+                res_d["notes"].append(f"Acoustic check skipped: {res_d.get('error')}")
+                res_d["ok"], res_d["error"] = True, None
+            res_d.update(risk=fused, confidence=conf, verdict=verdict)
+            # `findings()` renders res["flags"], so NLP evidence must be appended THERE
+            res_d["flags"] = list(res_d.get("flags", [])) + [f"Intent: {f}" for f in nlp_res.get("flags", [])]
+            return res_d
+
+        # Cache key: audio bytes + settings + whether ASR is installed. Prefix `_v3` retires results cached
+        # by older builds (which had no transcript) so stale transcript-less entries are never re-served.
+        res = _cached(
+            "res_audio_v3",
+            data + suffix.encode() + str(snr_db).encode() + (b"|asr1" if nlp_analyzer.asr_available() else b"|asr0"),
+            lambda: _tmp_run(data, suffix, _full_pipeline),
+        )
+
         clean = None
         if snr_db is not None:
-            clean = _cached("res_audio_clean", data + suffix.encode(),
-                            lambda: _tmp_run(data, suffix, lambda p: detector.analyze_audio_stream(p)))
+            clean = _cached(
+                "res_audio_clean", 
+                data + suffix.encode(),
+                lambda: _tmp_run(data, suffix, lambda p: detector.analyze_audio_stream(p))
+            )
+
         tag = f"noise{snr_db}" if snr_db is not None else ""
         register("audio", sha, res, tag)
         R["audio"] = (sha, res, tag)
+
         st.caption(f"Source: {label}")
-        if res["error"]:
+        if res.get("error"):
             st.warning(res["error"])
+
+        # Transcript is rendered explicitly so an empty / failed STT is visible, never silent
+        transcript = res.get("transcript") or ""
+        if transcript:
+            st.info(f"🎙️ Transcribed Audio: “{_md_safe(transcript)}”")
+        elif res.get("asr_error"):
+            st.warning(f"⚠️ Speech-to-text: {res['asr_error']}")
+        elif not res.get("ok") and res.get("error"):
+            pass                                          # already shown as the warning above
+        else:
+            st.caption("🎙️ No speech recognised in this clip (silence, music or noise only).")
+
         banner(res)
-        if clean is not None and clean["ok"] and res["ok"]:
-            st.info(f"Robustness: clean {round(clean['risk'] * 100)}% → with {snr_db} dB noise "
-                    f"{round(res['risk'] * 100)}%  (Δ {round((res['risk'] - clean['risk']) * 100):+d} pts)")
-        m = res["metrics"]
+
+        if clean is not None and clean.get("ok") and res.get("ok"):
+            st.info(
+                f"Robustness: clean {round(clean['risk'] * 100)}% → with {snr_db} dB noise "
+                f"{round(res.get('acoustic_risk', res['risk']) * 100)}%  "
+                f"(Δ {round((res.get('acoustic_risk', res['risk']) - clean['risk']) * 100):+d} pts, acoustic engine only)"
+            )
+
+        m = res.get("metrics", {})
         cards([
             latency_card(res),
             card("Pitch Deviation", fmt(m.get("pitch_dev_st"), ".2f"), "st",
@@ -429,10 +517,13 @@ def voice_panel(ns, snr_db):
             card("Pause Noise Floor", fmt(m.get("pause_floor_gap_db"), ".0f"), "dB",
                  "very high = digital silence"),
         ])
+
         findings(res)
+
         if sample and rec is None and up is None:
             sample_check(sample, res)
-    if res["spectrogram"] is not None and SPEC_OK:
+
+    if res.get("spectrogram") is not None and SPEC_OK:
         st.markdown('<div class="ptitle">Live spectral view</div>', unsafe_allow_html=True)
         fig = mel_figure(res["spectrogram"])
         st.pyplot(fig)
@@ -455,13 +546,11 @@ def text_panel(ns):
             def _asr():
                 d, sfx = SS["last_audio"]
                 txt, err = _tmp_run(d, sfx, nlp_analyzer.transcribe)
-                SS[key] = txt if txt else ""
-                SS["asr_err"] = err
+                SS[key] = txt or ""
+                SS["asr_err"] = err or (None if txt else "No speech recognised in the voice sample.")
             st.button("🎧 Transcribe the voice sample (local)", key=f"{ns}_asr_{n}", on_click=_asr)
             if SS.get("asr_err"):
                 st.warning(SS["asr_err"])
-        elif not nlp_analyzer.asr_available():
-            st.caption("Optional: `pip install faster-whisper` adds local auto-transcription.")
         txt = st.text_area("Paste or type what was said on the call", key=key, height=130,
                            placeholder="e.g. “Your account will be blocked. Share the OTP right now…”")
         if st.button("🗑 Clear transcript", key=f"{ns}_clr_text_{n}"):

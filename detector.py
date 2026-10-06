@@ -31,6 +31,7 @@ SR = 16000
 N_FFT, HOP = 1024, 160            # 64 ms window, 10 ms hop (feature frames)
 MEL_HOP, N_MELS = 256, 64         # spectrogram display
 MIN_AUDIO_S, MAX_AUDIO_S = 0.75, 15.0
+SILENCE_RMS = 1e-4                # RMS (full-scale = 1.0) below which a buffer is dead air / static floor
 MAX_IMG_SIDE = 640
 AUX_GAIN = 0.20                   # max share of the remaining headroom an aux cue group can add
 
@@ -216,6 +217,31 @@ def warm_up() -> None:
 # --------------------------------------------------------------------------- #
 # AUDIO
 # --------------------------------------------------------------------------- #
+def _load_audio_buffer(file_path: str) -> Tuple[np.ndarray, int]:
+    """Decode a recorded/uploaded file to a mono float32 buffer in [-1, 1] at SR Hz.
+
+    Browser mic clips (st.audio_input) are 44.1/48 kHz 16-bit PCM WAVs. soundfile returns integer PCM
+    already scaled to float [-1, 1] (no manual /32768), then we mix down and resample explicitly.
+    librosa.load (audioread) is the fallback for formats libsndfile cannot open (m4a, some mp3).
+    """
+    y = sr = None
+    try:
+        import soundfile as sf
+        with sf.SoundFile(file_path) as f:
+            sr = int(f.samplerate)
+            y = f.read(frames=int(MAX_AUDIO_S * sr), dtype="float32", always_2d=True).mean(axis=1)
+    except Exception:
+        y = None
+    if y is None:
+        y, sr = librosa.load(file_path, sr=None, mono=True, duration=MAX_AUDIO_S)
+    y = np.nan_to_num(np.asarray(y, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    if y.size:
+        y = y - float(np.mean(y))                       # DC offset (common on laptop / earphone mics)
+    if int(sr) != SR and y.size:
+        y = librosa.resample(y, orig_sr=int(sr), target_sr=SR)
+    return y.astype(np.float32), SR
+
+
 def analyze_audio_stream(file_path: str, noise_snr_db: Optional[float] = None) -> Dict[str, Any]:
     """Analyze a recorded/uploaded audio file. Never raises."""
     t0 = time.perf_counter()
@@ -224,11 +250,23 @@ def analyze_audio_stream(file_path: str, noise_snr_db: Optional[float] = None) -
         res["latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
         return res
     try:
-        y, sr = librosa.load(file_path, sr=SR, mono=True, duration=MAX_AUDIO_S)
+        y, sr = _load_audio_buffer(file_path)
     except Exception as exc:
         res = _empty("audio", f"Could not read audio file: {exc}")
         res["latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
         return res
+
+    # Silent / static-floor guard. Must run BEFORE peak-normalisation: normalising a near-silent buffer
+    # blows its noise floor up to full scale, which looks like loud static to every feature below.
+    rms = float(np.sqrt(np.mean(y.astype(np.float64) ** 2))) if y.size else 0.0
+    if not np.isfinite(rms) or rms < SILENCE_RMS:
+        res = _empty("audio", "Audio is silent or only static (mic muted / wrong input device?). "
+                              "Check the microphone and record again.")
+        res["latency_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+        return res
+
+    # Peak amplitude normalisation: quiet earphone / far-field mics -> consistent feature scale.
+    y = y / (float(np.max(np.abs(y))) + 1e-9)
     return analyze_audio_array(y, sr, _t0=t0, noise_snr_db=noise_snr_db)
 
 
@@ -252,8 +290,8 @@ def analyze_audio_array(y: np.ndarray, sr: int, _t0: Optional[float] = None,
         dur = len(y) / SR
         if dur < MIN_AUDIO_S:
             return done(_empty("audio", f"Clip too short ({dur:.2f}s). Record 2+ seconds of speech."))
-        if float(np.max(np.abs(y))) < 1e-4:
-            return done(_empty("audio", "Audio is silent."))
+        if float(np.sqrt(np.mean(y.astype(np.float64) ** 2))) < SILENCE_RMS:
+            return done(_empty("audio", "Audio is silent or only static (mic muted / wrong input device?)."))
         y = y / (np.max(np.abs(y)) + 1e-9)
         if noise_snr_db is not None:                     # robustness test
             y = add_noise(y, float(noise_snr_db))
@@ -277,6 +315,10 @@ def analyze_audio_array(y: np.ndarray, sr: int, _t0: Optional[float] = None,
         flat = librosa.feature.spectral_flatness(y=y, n_fft=N_FFT, hop_length=HOP)[0]
         try:
             f0 = librosa.yin(y, fmin=70, fmax=400, sr=SR, frame_length=N_FFT, hop_length=HOP)
+            f0 = np.asarray(f0, dtype=np.float64)
+            f0[~np.isfinite(f0) | (f0 <= 0)] = np.nan   # yin can return NaN / 0 on flat or digital-silence frames
+            if np.isnan(f0).all():
+                raise ValueError("no pitch")
         except Exception:
             f0 = None
             notes.append("Pitch tracker unavailable: spectral-only fallback scoring.")
@@ -296,15 +338,16 @@ def analyze_audio_array(y: np.ndarray, sr: int, _t0: Optional[float] = None,
 
         # pitch deviation + jitter proxy
         pitch_mean = pitch_dev = jitter = hnr = float("nan")
-        if f0 is not None:
-            f_v = f0[idx]
+        idx_p = idx[np.isfinite(f0[idx])] if f0 is not None else idx[:0]
+        if f0 is not None and idx_p.size >= 5:       # need real (non-NaN) pitch frames, else skip pitch cues
+            f_v = f0[idx_p]
             pitch_mean = float(np.median(f_v))
             pitch_dev = float(np.std(12 * np.log2(f_v / pitch_mean)))      # semitones
-            contiguous = np.diff(idx) == 1
+            contiguous = np.diff(idx_p) == 1
             d = np.abs(np.diff(f_v))[contiguous]
             if d.size > 5:
                 jitter = float(np.mean(d / f_v[:-1][contiguous]))
-            hnr = _hnr_proxy(y, f0, idx)
+            hnr = _hnr_proxy(y, f0, idx_p)
 
         # spectral centroid distribution / transitions, ZCR continuity
         c = cent[idx]

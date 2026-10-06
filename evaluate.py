@@ -51,7 +51,7 @@ def main():
         sub = [r for r in rows if r[0] == kind]
         y = np.array([r[1] for r in sub])
         s = np.array([r[2] for r in sub])
-        if len(set(y)) < 2:
+        if len(set(y)) <= 2:
             print(f"\n[{kind}] need both real and fake files for metrics ({len(sub)} files)")
             continue
         pred = np.array([r[3] != "AUTHENTIC" for r in sub])        # SUSPICIOUS or worse = flagged
